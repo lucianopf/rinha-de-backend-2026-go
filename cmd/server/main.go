@@ -526,9 +526,9 @@ func main() {
 		},
 		Name:               "rinha-fraud",
 		MaxRequestBodySize: 4096,
-		ReadTimeout:        5 * time.Second,
-		WriteTimeout:       5 * time.Second,
-		MaxConnsPerIP:      2000,
+		ReadTimeout:        2 * time.Second,
+		WriteTimeout:       2 * time.Second,
+		MaxConnsPerIP:      1000,
 	}
 
 	if err := server.ListenAndServe(addr); err != nil {
