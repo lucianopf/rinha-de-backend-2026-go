@@ -445,7 +445,7 @@ func handleReady(ctx *fasthttp.RequestCtx) {
 	ctx.SetBodyString("OK")
 }
 
-var probesFlag = flag.Int("probes", 16, "number of IVF clusters to probe per query")
+var probesFlag = flag.Int("probes", 10, "number of IVF clusters to probe per query")
 var dataPath = flag.String("data", "resources/references.bin", "path to preprocessed binary index")
 var normPath = flag.String("norm", "resources/normalization.json", "path to normalization constants")
 var mccPath = flag.String("mcc", "resources/mcc_risk.json", "path to MCC risk map")
@@ -526,9 +526,13 @@ func main() {
 		},
 		Name:               "rinha-fraud",
 		MaxRequestBodySize: 4096,
-		ReadTimeout:        2 * time.Second,
-		WriteTimeout:       2 * time.Second,
-		MaxConnsPerIP:      1000,
+		ReadTimeout:        5 * time.Second,
+		WriteTimeout:       5 * time.Second,
+		MaxConnsPerIP:      5000,
+		TCPKeepalive:       true,
+		TCPKeepalivePeriod: 30 * time.Second,
+		MaxIdleWorkerDuration: 10 * time.Second,
+		DisableKeepalive:   false,
 	}
 
 	if err := server.ListenAndServe(addr); err != nil {
