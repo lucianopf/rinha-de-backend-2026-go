@@ -7,7 +7,7 @@ services:
       resources:
         limits:
           cpus: "0.45"
-          memory: "250MB"
+          memory: "150MB"
     networks:
       - rinha
     restart: unless-stopped
@@ -20,7 +20,7 @@ services:
       resources:
         limits:
           cpus: "0.45"
-          memory: "250MB"
+          memory: "150MB"
     networks:
       - rinha
     restart: unless-stopped
@@ -35,7 +35,7 @@ services:
       resources:
         limits:
           cpus: "0.10"
-          memory: "100MB"
+          memory: "50MB"
     networks:
       - rinha
     depends_on:
