@@ -1,0 +1,43 @@
+services:
+  api1:
+    image: ghcr.io/lucianopf/rinha-de-backend-2026-go:latest
+    deploy:
+      resources:
+        limits:
+          cpus: "0.45"
+          memory: "150MB"
+    networks:
+      - rinha
+    restart: unless-stopped
+
+  api2:
+    image: ghcr.io/lucianopf/rinha-de-backend-2026-go:latest
+    deploy:
+      resources:
+        limits:
+          cpus: "0.45"
+          memory: "150MB"
+    networks:
+      - rinha
+    restart: unless-stopped
+
+  lb:
+    image: haproxy:3.0-alpine
+    ports:
+      - "9999:9999"
+    volumes:
+      - ./haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+    deploy:
+      resources:
+        limits:
+          cpus: "0.10"
+          memory: "50MB"
+    networks:
+      - rinha
+    depends_on:
+      - api1
+      - api2
+
+networks:
+  rinha:
+    driver: bridge
