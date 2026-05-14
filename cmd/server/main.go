@@ -7,6 +7,7 @@ import (
 	"math"
 	"os"
 	"strconv"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -25,133 +26,122 @@ type IVFIndex struct {
 	Dim       int
 	NClusters int
 
-	Centroids   []float32 // nClusters * dim, row-major
-	Clusters    [][]int32 // per-cluster vector indices
-	Vectors     []float32 // count * dim, row-major
-	Labels      []uint8   // count bytes: 0=legit, 1=fraud
-
-	Data []byte // mmap'd raw data (for lifetime)
+	Centroids []float32
+	Clusters  [][]int32
+	Vectors   []float32
+	Labels    []uint8
+	Data      []byte
 }
 
-type QueryParams struct {
-	Amount       float64
-	Installments int
-	RequestedAt  string
-
-	AvgAmount     float64
-	TxCount24h    int
-	KnownMerchants []string
-
-	MerchantID  string
-	MCC         string
-	MerchantAvg float64
-
-	IsOnline    bool
-	CardPresent bool
-	KmFromHome  float64
-
-	LastTxTimestamp    string
-	LastTxKmFromCurrent float64
-	HasLastTx          bool
-}
-
-// Normalization constants
 type NormConstants struct {
-	MaxAmount             float64 `json:"max_amount"`
-	MaxInstallments       float64 `json:"max_installments"`
-	AmountVsAvgRatio      float64 `json:"amount_vs_avg_ratio"`
-	MaxMinutes            float64 `json:"max_minutes"`
-	MaxKm                 float64 `json:"max_km"`
-	MaxTxCount24h         float64 `json:"max_tx_count_24h"`
-	MaxMerchantAvgAmount  float64 `json:"max_merchant_avg_amount"`
+	MaxAmount            float64
+	MaxInstallments      float64
+	AmountVsAvgRatio     float64
+	MaxMinutes           float64
+	MaxKm                float64
+	MaxTxCount24h        float64
+	MaxMerchantAvgAmount float64
 }
 
 // ====================================================================
-// KNN Search Implementation
+// Pre-allocated search buffers (pooled per request)
 // ====================================================================
 
-// Min-heap for tracking K nearest neighbors
-type neighbor struct {
-	dist  float32
-	label uint8
+type searchBufs struct {
+	centroidDists []float32
+	topClusters   []int32
+	topDists      []float32
+	heapDists     [5]float32
+	heapLabels    [5]uint8
+	heapSize      int
 }
 
-type neighborHeap struct {
-	items []neighbor
-	k     int
+var bufsPool = sync.Pool{
+	New: func() interface{} {
+		return &searchBufs{
+			centroidDists: make([]float32, 2048),
+			topClusters:   make([]int32, 32),
+			topDists:      make([]float32, 32),
+		}
+	},
 }
 
-func newNeighborHeap(k int) *neighborHeap {
-	return &neighborHeap{items: make([]neighbor, 0, k), k: k}
+var parserPool = sync.Pool{
+	New: func() interface{} {
+		return &fastjson.Parser{}
+	},
 }
 
-func (h *neighborHeap) push(dist float32, label uint8) {
-	if len(h.items) < h.k {
-		h.items = append(h.items, neighbor{dist, label})
-		// sift up
-		i := len(h.items) - 1
+// ====================================================================
+// Fixed-size max-heap (tracks K smallest distances, inlined)
+// ====================================================================
+
+func heapPush(dists *[5]float32, labels *[5]uint8, size *int, k int, dist float32, label uint8) {
+	if *size < k {
+		i := *size
+		dists[i] = dist
+		labels[i] = label
+		*size++
 		for i > 0 {
 			parent := (i - 1) / 2
-			if h.items[parent].dist >= h.items[i].dist {
+			if dists[parent] >= dists[i] {
 				break
 			}
-			h.items[parent], h.items[i] = h.items[i], h.items[parent]
+			dists[parent], dists[i] = dists[i], dists[parent]
+			labels[parent], labels[i] = labels[i], labels[parent]
 			i = parent
 		}
-	} else if dist < h.items[0].dist {
-		h.items[0] = neighbor{dist, label}
-		// sift down
+	} else if dist < dists[0] {
+		dists[0] = dist
+		labels[0] = label
 		i := 0
 		for {
 			largest := i
 			left := 2*i + 1
 			right := 2*i + 2
-			if left < h.k && h.items[left].dist > h.items[largest].dist {
+			if left < k && dists[left] > dists[largest] {
 				largest = left
 			}
-			if right < h.k && h.items[right].dist > h.items[largest].dist {
+			if right < k && dists[right] > dists[largest] {
 				largest = right
 			}
 			if largest == i {
 				break
 			}
-			h.items[i], h.items[largest] = h.items[largest], h.items[i]
+			dists[i], dists[largest] = dists[largest], dists[i]
+			labels[i], labels[largest] = labels[largest], labels[i]
 			i = largest
 		}
 	}
 }
 
-func (h *neighborHeap) countFrauds() int {
-	n := 0
-	for _, nb := range h.items {
-		if nb.label == 1 {
-			n++
-		}
-	}
-	return n
-}
+// ====================================================================
+// IVF Search (zero-allocation via pool)
+// ====================================================================
 
-// IVF search: find nearest centroids, probe top clusters
 func (idx *IVFIndex) Search(query []float32, probes int) (approved bool, fraudScore float64) {
+	b := bufsPool.Get().(*searchBufs)
+	defer bufsPool.Put(b)
+
 	dim := idx.Dim
 	nClusters := idx.NClusters
+	centroidDists := b.centroidDists[:nClusters]
 
-	// Find distances to all centroids
-	centroidDists := make([]float32, nClusters)
+	// Compute distances to all centroids
+	centroids := idx.Centroids
 	for c := 0; c < nClusters; c++ {
 		base := c * dim
 		var sum float32
-		// Unrolled for auto-vectorization
 		for d := 0; d < dim; d++ {
-			diff := query[d] - idx.Centroids[base+d]
+			diff := query[d] - centroids[base+d]
 			sum += diff * diff
 		}
 		centroidDists[c] = sum
 	}
 
-	// Find top 'probes' clusters (simple partial sort)
-	topClusters := make([]int, probes)
-	topDists := make([]float32, probes)
+	// Find top probes clusters
+	topClusters := b.topClusters[:probes]
+	topDists := b.topDists[:probes]
 	for i := range topClusters {
 		topClusters[i] = -1
 		topDists[i] = float32(math.MaxFloat32)
@@ -159,7 +149,6 @@ func (idx *IVFIndex) Search(query []float32, probes int) (approved bool, fraudSc
 
 	for c := 0; c < nClusters; c++ {
 		dist := centroidDists[c]
-		// Find position in topClusters
 		pos := probes
 		for p := 0; p < probes; p++ {
 			if dist < topDists[p] {
@@ -168,41 +157,54 @@ func (idx *IVFIndex) Search(query []float32, probes int) (approved bool, fraudSc
 			}
 		}
 		if pos < probes {
-			// Shift right and insert
 			copy(topClusters[pos+1:], topClusters[pos:probes-1])
 			copy(topDists[pos+1:], topDists[pos:probes-1])
-			topClusters[pos] = c
+			topClusters[pos] = int32(c)
 			topDists[pos] = dist
 		}
 	}
 
-	// Search exact KNN in probed clusters
-	heap := newNeighborHeap(5)
+	// Exact KNN in probed clusters
+	heapDists := &b.heapDists
+	heapLabels := &b.heapLabels
+	heapSize := 0
+	vectors := idx.Vectors
+	labels := idx.Labels
+
 	for p := 0; p < probes && topClusters[p] >= 0; p++ {
 		c := topClusters[p]
 		for _, vi := range idx.Clusters[c] {
 			vbase := int(vi) * dim
-			var sum float32
-			// Unrolled euclidean distance
-			sum += (query[0] - idx.Vectors[vbase+0]) * (query[0] - idx.Vectors[vbase+0])
-			sum += (query[1] - idx.Vectors[vbase+1]) * (query[1] - idx.Vectors[vbase+1])
-			sum += (query[2] - idx.Vectors[vbase+2]) * (query[2] - idx.Vectors[vbase+2])
-			sum += (query[3] - idx.Vectors[vbase+3]) * (query[3] - idx.Vectors[vbase+3])
-			sum += (query[4] - idx.Vectors[vbase+4]) * (query[4] - idx.Vectors[vbase+4])
-			sum += (query[5] - idx.Vectors[vbase+5]) * (query[5] - idx.Vectors[vbase+5])
-			sum += (query[6] - idx.Vectors[vbase+6]) * (query[6] - idx.Vectors[vbase+6])
-			sum += (query[7] - idx.Vectors[vbase+7]) * (query[7] - idx.Vectors[vbase+7])
-			sum += (query[8] - idx.Vectors[vbase+8]) * (query[8] - idx.Vectors[vbase+8])
-			sum += (query[9] - idx.Vectors[vbase+9]) * (query[9] - idx.Vectors[vbase+9])
-			sum += (query[10] - idx.Vectors[vbase+10]) * (query[10] - idx.Vectors[vbase+10])
-			sum += (query[11] - idx.Vectors[vbase+11]) * (query[11] - idx.Vectors[vbase+11])
-			sum += (query[12] - idx.Vectors[vbase+12]) * (query[12] - idx.Vectors[vbase+12])
-			sum += (query[13] - idx.Vectors[vbase+13]) * (query[13] - idx.Vectors[vbase+13])
-			heap.push(sum, idx.Labels[vi])
+			q := query
+
+			d0 := q[0] - vectors[vbase+0]
+			d1 := q[1] - vectors[vbase+1]
+			d2 := q[2] - vectors[vbase+2]
+			d3 := q[3] - vectors[vbase+3]
+			d4 := q[4] - vectors[vbase+4]
+			d5 := q[5] - vectors[vbase+5]
+			d6 := q[6] - vectors[vbase+6]
+			d7 := q[7] - vectors[vbase+7]
+			d8 := q[8] - vectors[vbase+8]
+			d9 := q[9] - vectors[vbase+9]
+			d10 := q[10] - vectors[vbase+10]
+			d11 := q[11] - vectors[vbase+11]
+			d12 := q[12] - vectors[vbase+12]
+			d13 := q[13] - vectors[vbase+13]
+
+			sum := d0*d0 + d1*d1 + d2*d2 + d3*d3 + d4*d4 + d5*d5 + d6*d6 +
+				d7*d7 + d8*d8 + d9*d9 + d10*d10 + d11*d11 + d12*d12 + d13*d13
+
+			heapPush(heapDists, heapLabels, &heapSize, 5, sum, labels[vi])
 		}
 	}
 
-	frauds := heap.countFrauds()
+	frauds := 0
+	for i := 0; i < heapSize; i++ {
+		if heapLabels[i] == 1 {
+			frauds++
+		}
+	}
 	fraudScore = float64(frauds) / 5.0
 	approved = fraudScore < 0.6
 	return
@@ -229,11 +231,10 @@ func LoadIVFIndex(path string) (*IVFIndex, error) {
 		f.Close()
 		return nil, err
 	}
-	f.Close() // fd can be closed after mmap
+	f.Close()
 
 	idx := &IVFIndex{Data: data}
 
-	// Header
 	idx.Count = int(binary.LittleEndian.Uint32(data[0:4]))
 	idx.Dim = int(binary.LittleEndian.Uint32(data[4:8]))
 	idx.NClusters = int(binary.LittleEndian.Uint32(data[8:12]))
@@ -241,28 +242,23 @@ func LoadIVFIndex(path string) (*IVFIndex, error) {
 	dim := idx.Dim
 	nClusters := idx.NClusters
 
-	// Centroids
 	centroidBytes := nClusters * dim * 4
 	idx.Centroids = unsafe.Slice((*float32)(unsafe.Pointer(&data[12])), nClusters*dim)
 
 	pos := 12 + centroidBytes
 
-	// Cluster assignments
 	idx.Clusters = make([][]int32, nClusters)
 	for c := 0; c < nClusters; c++ {
 		n := int(binary.LittleEndian.Uint32(data[pos : pos+4]))
 		pos += 4
-		clusterSize := n * 4
 		idx.Clusters[c] = unsafe.Slice((*int32)(unsafe.Pointer(&data[pos])), n)
-		pos += clusterSize
+		pos += n * 4
 	}
 
-	// Vectors
 	vectorBytes := idx.Count * dim * 4
 	idx.Vectors = unsafe.Slice((*float32)(unsafe.Pointer(&data[pos])), idx.Count*dim)
 	pos += vectorBytes
 
-	// Labels
 	idx.Labels = data[pos : pos+idx.Count]
 
 	return idx, nil
@@ -273,35 +269,18 @@ func LoadIVFIndex(path string) (*IVFIndex, error) {
 // ====================================================================
 
 var (
-	norm   NormConstants
-	mccMap map[string]float64
-	ready  int32
-	index  *IVFIndex
+	norm      NormConstants
+	mccMap    map[string]float64
+	readyFlag int32
+	index     *IVFIndex
 )
 
-func loadMCCRisk(path string) (map[string]float64, error) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return nil, err
+func clamp(v float64) float64 {
+	if v < 0 {
+		return 0
 	}
-	var p fastjson.Parser
-	v, err := p.Parse(string(data))
-	if err != nil {
-		return nil, err
-	}
-	m := make(map[string]float64)
-	v.GetObject().Visit(func(key []byte, val *fastjson.Value) {
-		m[string(key)] = val.GetFloat64()
-	})
-	return m, nil
-}
-
-func floatClamp(v, lo, hi float64) float64 {
-	if v < lo {
-		return lo
-	}
-	if v > hi {
-		return hi
+	if v > 1 {
+		return 1
 	}
 	return v
 }
@@ -309,92 +288,90 @@ func floatClamp(v, lo, hi float64) float64 {
 func parseTimestamp(ts string) time.Time {
 	t, err := time.Parse(time.RFC3339, ts)
 	if err != nil {
-		// Attempt with simpler format
 		t, _ = time.Parse("2006-01-02T15:04:05Z", ts)
 	}
 	return t
 }
 
-// Day of week: Monday=0, Sunday=6 (C convention, Tomohiko Sakamoto)
-// Go's Weekday: Sunday=0, Saturday=6
-// Conversion: cDow = (goDow + 6) % 7
 func dayOfWeekC(t time.Time) int {
 	return (int(t.Weekday()) + 6) % 7
 }
 
 func buildVector(body []byte) (vec [14]float32) {
-	var p fastjson.Parser
+	p := parserPool.Get().(*fastjson.Parser)
 	v, err := p.ParseBytes(body)
 	if err != nil {
+		parserPool.Put(p)
 		return vec
 	}
 
-	// Transaction fields
 	amount := v.GetFloat64("transaction", "amount")
 	installments := v.GetFloat64("transaction", "installments")
 	requestedAt := string(v.GetStringBytes("transaction", "requested_at"))
 
-	// Customer fields
 	avgAmount := v.GetFloat64("customer", "avg_amount")
 	txCount24h := v.GetFloat64("customer", "tx_count_24h")
 	knownMerchants := v.GetArray("customer", "known_merchants")
 
-	// Merchant fields
 	merchantID := string(v.GetStringBytes("merchant", "id"))
 	mcc := string(v.GetStringBytes("merchant", "mcc"))
 	merchantAvg := v.GetFloat64("merchant", "avg_amount")
 
-	// Terminal fields
 	isOnline := v.GetBool("terminal", "is_online")
 	cardPresent := v.GetBool("terminal", "card_present")
 	kmFromHome := v.GetFloat64("terminal", "km_from_home")
 
-	// Last transaction
 	lastTx := v.Get("last_transaction")
 	hasLastTx := lastTx != nil && lastTx.Type() != fastjson.TypeNull
 
-	// ---- Build vector ----
+	// Cache values we need after parser return
+	var lastTs string
+	var kmLast float64
+	if hasLastTx {
+		lastTs = string(v.GetStringBytes("last_transaction", "timestamp"))
+		kmLast = v.GetFloat64("last_transaction", "km_from_current")
+	}
+
+	parserPool.Put(p)
 
 	// 0: amount
-	vec[0] = float32(floatClamp(amount/norm.MaxAmount, 0, 1))
+	vec[0] = float32(clamp(amount / norm.MaxAmount))
 
 	// 1: installments
-	vec[1] = float32(floatClamp(installments/norm.MaxInstallments, 0, 1))
+	vec[1] = float32(clamp(installments / norm.MaxInstallments))
 
 	// 2: amount_vs_avg
-	vec[2] = float32(floatClamp((amount/avgAmount)/norm.AmountVsAvgRatio, 0, 1))
+	vec[2] = float32(clamp((amount / avgAmount) / norm.AmountVsAvgRatio))
 
 	// 3: hour_of_day
 	t := parseTimestamp(requestedAt)
-	vec[3] = float32(floatClamp(float64(t.Hour())/23.0, 0, 1))
+	vec[3] = float32(clamp(float64(t.Hour()) / 23.0))
 
-	// 4: day_of_week (Monday=0, Sunday=6)
+	// 4: day_of_week
 	cDow := dayOfWeekC(t)
-	vec[4] = float32(floatClamp(float64(cDow)/6.0, 0, 1))
+	vec[4] = float32(clamp(float64(cDow) / 6.0))
 
 	// 5: minutes_since_last_tx
 	if hasLastTx {
-		lastTs := string(v.GetStringBytes("last_transaction", "timestamp"))
 		lt := parseTimestamp(lastTs)
 		mins := t.Sub(lt).Minutes()
-		vec[5] = float32(floatClamp(mins/norm.MaxMinutes, 0, 1))
+		vec[5] = float32(clamp(mins / norm.MaxMinutes))
 	} else {
 		vec[5] = -1
 	}
 
 	// 6: km_from_last_tx
 	if hasLastTx {
-		kmLast := v.GetFloat64("last_transaction", "km_from_current")
-		vec[6] = float32(floatClamp(kmLast/norm.MaxKm, 0, 1))
+		vec[6] = float32(clamp(kmLast / norm.MaxKm))
 	} else {
 		vec[6] = -1
 	}
 
 	// 7: km_from_home
-	vec[7] = float32(floatClamp(kmFromHome/norm.MaxKm, 0, 1))
+	vec[7] = float32(clamp(kmFromHome / norm.MaxKm))
 
 	// 8: tx_count_24h
-	vec[8] = float32(floatClamp(txCount24h/norm.MaxTxCount24h, 0, 1))
+	vec[8] = float32(clamp(txCount24h / norm.MaxTxCount24h))
 
 	// 9: is_online
 	if isOnline {
@@ -406,7 +383,7 @@ func buildVector(body []byte) (vec [14]float32) {
 		vec[10] = 1
 	}
 
-	// 11: unknown_merchant (1 = desconhecido)
+	// 11: unknown_merchant
 	isKnown := false
 	if knownMerchants != nil {
 		for _, km := range knownMerchants {
@@ -428,7 +405,7 @@ func buildVector(body []byte) (vec [14]float32) {
 	vec[12] = float32(risk)
 
 	// 13: merchant_avg_amount
-	vec[13] = float32(floatClamp(merchantAvg/norm.MaxMerchantAvgAmount, 0, 1))
+	vec[13] = float32(clamp(merchantAvg / norm.MaxMerchantAvgAmount))
 
 	return vec
 }
@@ -437,30 +414,29 @@ func buildVector(body []byte) (vec [14]float32) {
 // HTTP Handlers
 // ====================================================================
 
-// Fraud score response templates
-const (
-	respApproved0 = `{"approved":true,"fraud_score":0.0}`
-	respApproved2 = `{"approved":true,"fraud_score":0.2}`
-	respApproved4 = `{"approved":true,"fraud_score":0.4}`
-	respDenied6   = `{"approved":false,"fraud_score":0.6}`
-	respDenied8   = `{"approved":false,"fraud_score":0.8}`
-	respDenied10  = `{"approved":false,"fraud_score":1.0}`
+var (
+	respApproved0 = []byte(`{"approved":true,"fraud_score":0.0}`)
+	respApproved2 = []byte(`{"approved":true,"fraud_score":0.2}`)
+	respApproved4 = []byte(`{"approved":true,"fraud_score":0.4}`)
+	respDenied6   = []byte(`{"approved":false,"fraud_score":0.6}`)
+	respDenied8   = []byte(`{"approved":false,"fraud_score":0.8}`)
+	respDenied10  = []byte(`{"approved":false,"fraud_score":1.0}`)
 )
 
 func fraudScoreResponse(approved bool, fraudScore float64) []byte {
 	switch {
 	case fraudScore < 0.2:
-		return []byte(respApproved0)
+		return respApproved0
 	case fraudScore < 0.4:
-		return []byte(respApproved2)
+		return respApproved2
 	case fraudScore < 0.6:
-		return []byte(respApproved4)
+		return respApproved4
 	case fraudScore < 0.8:
-		return []byte(respDenied6)
+		return respDenied6
 	case fraudScore < 1.0:
-		return []byte(respDenied8)
+		return respDenied8
 	default:
-		return []byte(respDenied10)
+		return respDenied10
 	}
 }
 
@@ -490,7 +466,6 @@ func main() {
 
 	var err error
 
-	// Load normalization constants
 	normData, err := os.ReadFile(*normPath)
 	if err != nil {
 		log.Fatalf("Failed to read normalization.json: %v", err)
@@ -511,10 +486,18 @@ func main() {
 	}
 
 	// Load MCC risk map
-	mccMap, err = loadMCCRisk(*mccPath)
+	mccData, err := os.ReadFile(*mccPath)
 	if err != nil {
 		log.Fatalf("Failed to load mcc_risk.json: %v", err)
 	}
+	mccV, err := p.Parse(string(mccData))
+	if err != nil {
+		log.Fatalf("Failed to parse mcc_risk.json: %v", err)
+	}
+	mccMap = make(map[string]float64)
+	mccV.GetObject().Visit(func(key []byte, val *fastjson.Value) {
+		mccMap[string(key)] = val.GetFloat64()
+	})
 
 	// Load IVF index
 	log.Printf("Loading IVF index from %s...", *dataPath)
@@ -525,9 +508,8 @@ func main() {
 	log.Printf("Loaded: %d vectors, %d dims, %d clusters, %d probes",
 		index.Count, index.Dim, index.NClusters, *probesFlag)
 
-	atomic.StoreInt32(&ready, 1)
+	atomic.StoreInt32(&readyFlag, 1)
 
-	// Start fasthttp server
 	addr := ":" + strconv.Itoa(*port)
 	log.Printf("Listening on %s", addr)
 
