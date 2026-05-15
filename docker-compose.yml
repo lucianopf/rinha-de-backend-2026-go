@@ -26,11 +26,11 @@ services:
     restart: unless-stopped
 
   lb:
-    image: haproxy:3.0-alpine
+    build:
+      context: .
+      dockerfile: Dockerfile.lb
     ports:
       - "9999:9999"
-    volumes:
-      - ./haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
     deploy:
       resources:
         limits:
