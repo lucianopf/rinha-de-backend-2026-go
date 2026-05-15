@@ -18,7 +18,7 @@ import (
 )
 
 // ====================================================================
-// Data Structures (uint8-quantized)
+// Data Structures
 // ====================================================================
 
 type IVFIndex struct {
@@ -26,11 +26,9 @@ type IVFIndex struct {
 	Dim       int
 	NClusters int
 
-	Mins      []float32 // per-dimension min (for query quantization)
-	Maxs      []float32 // per-dimension max
-	Centroids []uint8   // quantized centroids (nClusters * dim)
+	Centroids []float32
 	Clusters  [][]int32
-	Vectors   []uint8 // quantized vectors (count * dim)
+	Vectors   []float32
 	Labels    []uint8
 	Data      []byte
 }
@@ -46,14 +44,14 @@ type NormConstants struct {
 }
 
 // ====================================================================
-// Pre-allocated search buffers (pooled per request) — int32 distances
+// Pre-allocated search buffers (pooled per request)
 // ====================================================================
 
 type searchBufs struct {
-	centroidDists []int32
+	centroidDists []float32
 	topClusters   []int32
-	topDists      []int32
-	heapDists     [5]int32
+	topDists      []float32
+	heapDists     [5]float32
 	heapLabels    [5]uint8
 	heapSize      int
 }
@@ -61,9 +59,9 @@ type searchBufs struct {
 var bufsPool = sync.Pool{
 	New: func() interface{} {
 		return &searchBufs{
-			centroidDists: make([]int32, 2048),
+			centroidDists: make([]float32, 2048),
 			topClusters:   make([]int32, 32),
-			topDists:      make([]int32, 32),
+			topDists:      make([]float32, 32),
 		}
 	},
 }
@@ -75,10 +73,10 @@ var parserPool = sync.Pool{
 }
 
 // ====================================================================
-// Fixed-size max-heap (tracks K smallest int32 distances, inlined)
+// Fixed-size max-heap (tracks K smallest distances, inlined)
 // ====================================================================
 
-func heapPush(dists *[5]int32, labels *[5]uint8, size *int, k int, dist int32, label uint8) {
+func heapPush(dists *[5]float32, labels *[5]uint8, size *int, k int, dist float32, label uint8) {
 	if *size < k {
 		i := *size
 		dists[i] = dist
@@ -118,10 +116,10 @@ func heapPush(dists *[5]int32, labels *[5]uint8, size *int, k int, dist int32, l
 }
 
 // ====================================================================
-// IVF Search (uint8 integer distances, zero-allocation via pool)
+// IVF Search (zero-allocation via pool)
 // ====================================================================
 
-func (idx *IVFIndex) Search(queryU8 []uint8, probes int) (approved bool, fraudScore float64) {
+func (idx *IVFIndex) Search(query []float32, probes int) (approved bool, fraudScore float64) {
 	b := bufsPool.Get().(*searchBufs)
 	defer bufsPool.Put(b)
 
@@ -129,13 +127,13 @@ func (idx *IVFIndex) Search(queryU8 []uint8, probes int) (approved bool, fraudSc
 	nClusters := idx.NClusters
 	centroidDists := b.centroidDists[:nClusters]
 
-	// Compute int32 distances to all centroids (uint8)
+	// Compute distances to all centroids
 	centroids := idx.Centroids
 	for c := 0; c < nClusters; c++ {
 		base := c * dim
-		var sum int32
+		var sum float32
 		for d := 0; d < dim; d++ {
-			diff := int32(queryU8[d]) - int32(centroids[base+d])
+			diff := query[d] - centroids[base+d]
 			sum += diff * diff
 		}
 		centroidDists[c] = sum
@@ -146,7 +144,7 @@ func (idx *IVFIndex) Search(queryU8 []uint8, probes int) (approved bool, fraudSc
 	topDists := b.topDists[:probes]
 	for i := range topClusters {
 		topClusters[i] = -1
-		topDists[i] = math.MaxInt32
+		topDists[i] = float32(math.MaxFloat32)
 	}
 
 	for c := 0; c < nClusters; c++ {
@@ -166,7 +164,7 @@ func (idx *IVFIndex) Search(queryU8 []uint8, probes int) (approved bool, fraudSc
 		}
 	}
 
-	// Exact KNN in probed clusters (uint8 integer distances)
+	// Exact KNN in probed clusters
 	heapDists := &b.heapDists
 	heapLabels := &b.heapLabels
 	heapSize := 0
@@ -177,22 +175,22 @@ func (idx *IVFIndex) Search(queryU8 []uint8, probes int) (approved bool, fraudSc
 		c := topClusters[p]
 		for _, vi := range idx.Clusters[c] {
 			vbase := int(vi) * dim
-			q := queryU8
+			q := query
 
-			d0 := int32(q[0]) - int32(vectors[vbase+0])
-			d1 := int32(q[1]) - int32(vectors[vbase+1])
-			d2 := int32(q[2]) - int32(vectors[vbase+2])
-			d3 := int32(q[3]) - int32(vectors[vbase+3])
-			d4 := int32(q[4]) - int32(vectors[vbase+4])
-			d5 := int32(q[5]) - int32(vectors[vbase+5])
-			d6 := int32(q[6]) - int32(vectors[vbase+6])
-			d7 := int32(q[7]) - int32(vectors[vbase+7])
-			d8 := int32(q[8]) - int32(vectors[vbase+8])
-			d9 := int32(q[9]) - int32(vectors[vbase+9])
-			d10 := int32(q[10]) - int32(vectors[vbase+10])
-			d11 := int32(q[11]) - int32(vectors[vbase+11])
-			d12 := int32(q[12]) - int32(vectors[vbase+12])
-			d13 := int32(q[13]) - int32(vectors[vbase+13])
+			d0 := q[0] - vectors[vbase+0]
+			d1 := q[1] - vectors[vbase+1]
+			d2 := q[2] - vectors[vbase+2]
+			d3 := q[3] - vectors[vbase+3]
+			d4 := q[4] - vectors[vbase+4]
+			d5 := q[5] - vectors[vbase+5]
+			d6 := q[6] - vectors[vbase+6]
+			d7 := q[7] - vectors[vbase+7]
+			d8 := q[8] - vectors[vbase+8]
+			d9 := q[9] - vectors[vbase+9]
+			d10 := q[10] - vectors[vbase+10]
+			d11 := q[11] - vectors[vbase+11]
+			d12 := q[12] - vectors[vbase+12]
+			d13 := q[13] - vectors[vbase+13]
 
 			sum := d0*d0 + d1*d1 + d2*d2 + d3*d3 + d4*d4 + d5*d5 + d6*d6 +
 				d7*d7 + d8*d8 + d9*d9 + d10*d10 + d11*d11 + d12*d12 + d13*d13
@@ -213,7 +211,7 @@ func (idx *IVFIndex) Search(queryU8 []uint8, probes int) (approved bool, fraudSc
 }
 
 // ====================================================================
-// IVF Index Loading (mmap) — uint8 format
+// IVF Index Loading (mmap)
 // ====================================================================
 
 func LoadIVFIndex(path string) (*IVFIndex, error) {
@@ -244,20 +242,11 @@ func LoadIVFIndex(path string) (*IVFIndex, error) {
 	dim := idx.Dim
 	nClusters := idx.NClusters
 
-	// Read per-dimension mins and maxs (float32)
-	pos := 12
-	minBytes := dim * 4
-	idx.Mins = unsafe.Slice((*float32)(unsafe.Pointer(&data[pos])), dim)
-	pos += minBytes
-	idx.Maxs = unsafe.Slice((*float32)(unsafe.Pointer(&data[pos])), dim)
-	pos += minBytes
+	centroidBytes := nClusters * dim * 4
+	idx.Centroids = unsafe.Slice((*float32)(unsafe.Pointer(&data[12])), nClusters*dim)
 
-	// Quantized centroids (uint8)
-	centroidBytes := nClusters * dim * 1
-	idx.Centroids = data[pos : pos+centroidBytes]
-	pos += centroidBytes
+	pos := 12 + centroidBytes
 
-	// Cluster assignments
 	idx.Clusters = make([][]int32, nClusters)
 	for c := 0; c < nClusters; c++ {
 		n := int(binary.LittleEndian.Uint32(data[pos : pos+4]))
@@ -266,19 +255,17 @@ func LoadIVFIndex(path string) (*IVFIndex, error) {
 		pos += n * 4
 	}
 
-	// Quantized vectors (uint8)
-	vectorBytes := idx.Count * dim * 1
-	idx.Vectors = data[pos : pos+vectorBytes]
+	vectorBytes := idx.Count * dim * 4
+	idx.Vectors = unsafe.Slice((*float32)(unsafe.Pointer(&data[pos])), idx.Count*dim)
 	pos += vectorBytes
 
-	// Labels (uint8)
 	idx.Labels = data[pos : pos+idx.Count]
 
 	return idx, nil
 }
 
 // ====================================================================
-// Vectorization (14 dimensions → float32, unchanged)
+// Vectorization (14 dimensions)
 // ====================================================================
 
 var (
@@ -337,6 +324,7 @@ func buildVector(body []byte) (vec [14]float32) {
 	lastTx := v.Get("last_transaction")
 	hasLastTx := lastTx != nil && lastTx.Type() != fastjson.TypeNull
 
+	// Cache values we need after parser return
 	var lastTs string
 	var kmLast float64
 	if hasLastTx {
@@ -348,16 +336,21 @@ func buildVector(body []byte) (vec [14]float32) {
 
 	// 0: amount
 	vec[0] = float32(clamp(amount / norm.MaxAmount))
+
 	// 1: installments
 	vec[1] = float32(clamp(installments / norm.MaxInstallments))
+
 	// 2: amount_vs_avg
 	vec[2] = float32(clamp((amount / avgAmount) / norm.AmountVsAvgRatio))
+
 	// 3: hour_of_day
 	t := parseTimestamp(requestedAt)
 	vec[3] = float32(clamp(float64(t.Hour()) / 23.0))
+
 	// 4: day_of_week
 	cDow := dayOfWeekC(t)
 	vec[4] = float32(clamp(float64(cDow) / 6.0))
+
 	// 5: minutes_since_last_tx
 	if hasLastTx {
 		lt := parseTimestamp(lastTs)
@@ -366,24 +359,30 @@ func buildVector(body []byte) (vec [14]float32) {
 	} else {
 		vec[5] = -1
 	}
+
 	// 6: km_from_last_tx
 	if hasLastTx {
 		vec[6] = float32(clamp(kmLast / norm.MaxKm))
 	} else {
 		vec[6] = -1
 	}
+
 	// 7: km_from_home
 	vec[7] = float32(clamp(kmFromHome / norm.MaxKm))
+
 	// 8: tx_count_24h
 	vec[8] = float32(clamp(txCount24h / norm.MaxTxCount24h))
+
 	// 9: is_online
 	if isOnline {
 		vec[9] = 1
 	}
+
 	// 10: card_present
 	if cardPresent {
 		vec[10] = 1
 	}
+
 	// 11: unknown_merchant
 	isKnown := false
 	if knownMerchants != nil {
@@ -397,43 +396,18 @@ func buildVector(body []byte) (vec [14]float32) {
 	if !isKnown {
 		vec[11] = 1
 	}
+
 	// 12: mcc_risk
 	risk, ok := mccMap[mcc]
 	if !ok {
 		risk = 0.5
 	}
 	vec[12] = float32(risk)
+
 	// 13: merchant_avg_amount
 	vec[13] = float32(clamp(merchantAvg / norm.MaxMerchantAvgAmount))
 
 	return vec
-}
-
-// ====================================================================
-// Query quantization: float32 features → uint8
-// ====================================================================
-
-func quantizeQuery(feats [14]float32) (q [14]uint8) {
-	mins := index.Mins
-	maxs := index.Maxs
-	for d := 0; d < 14; d++ {
-		f := feats[d]
-		rng := maxs[d] - mins[d]
-		if f < mins[d] {
-			f = mins[d]
-		} else if f > maxs[d] {
-			f = maxs[d]
-		}
-		v := (f - mins[d]) / rng * 255.0
-		if v < 0 {
-			v = 0
-		}
-		if v > 255 {
-			v = 255
-		}
-		q[d] = uint8(v + 0.5)
-	}
-	return q
 }
 
 // ====================================================================
@@ -478,9 +452,8 @@ var mccPath = flag.String("mcc", "resources/mcc_risk.json", "path to MCC risk ma
 var port = flag.Int("port", 8080, "HTTP listen port")
 
 func handleFraudScore(ctx *fasthttp.RequestCtx) {
-	feats := buildVector(ctx.PostBody())
-	queryU8 := quantizeQuery(feats)
-	approved, fraudScore := index.Search(queryU8[:], *probesFlag)
+	vect := buildVector(ctx.PostBody())
+	approved, fraudScore := index.Search(vect[:], *probesFlag)
 
 	resp := fraudScoreResponse(approved, fraudScore)
 	ctx.SetStatusCode(fasthttp.StatusOK)
@@ -512,6 +485,7 @@ func main() {
 		MaxMerchantAvgAmount: normV.GetFloat64("max_merchant_avg_amount"),
 	}
 
+	// Load MCC risk map
 	mccData, err := os.ReadFile(*mccPath)
 	if err != nil {
 		log.Fatalf("Failed to load mcc_risk.json: %v", err)
@@ -526,18 +500,18 @@ func main() {
 	})
 
 	// Load IVF index
-	log.Printf("[uint8] Loading IVF index from %s...", *dataPath)
+	log.Printf("Loading IVF index from %s...", *dataPath)
 	index, err = LoadIVFIndex(*dataPath)
 	if err != nil {
 		log.Fatalf("Failed to load IVF index: %v", err)
 	}
-	log.Printf("[uint8] Loaded: %d vectors, %d dims, %d clusters, %d probes",
+	log.Printf("Loaded: %d vectors, %d dims, %d clusters, %d probes",
 		index.Count, index.Dim, index.NClusters, *probesFlag)
 
 	atomic.StoreInt32(&readyFlag, 1)
 
 	addr := ":" + strconv.Itoa(*port)
-	log.Printf("[uint8] Listening on %s", addr)
+	log.Printf("Listening on %s", addr)
 
 	server := &fasthttp.Server{
 		Handler: func(ctx *fasthttp.RequestCtx) {
