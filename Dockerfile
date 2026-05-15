@@ -27,11 +27,11 @@ ENV GOMEMLIMIT=140MiB
 WORKDIR /app
 
 COPY --from=builder /app/server .
-COPY resources/references.bin ./resources/references.bin
+COPY resources/model.bin ./resources/model.bin
 COPY resources/normalization.json ./resources/normalization.json
 COPY resources/mcc_risk.json ./resources/mcc_risk.json
 
 EXPOSE 8080
 
 ENTRYPOINT ["./server"]
-CMD ["--port", "8080", "--data", "resources/references.bin"]
+CMD ["--port", "8080", "--model", "resources/model.bin"]
