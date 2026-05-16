@@ -24,10 +24,11 @@ services:
     restart: unless-stopped
 
   lb:
-    image: ghcr.io/lucianopf/rinha-de-backend-2026-go:latest
-    command: ["./lb", "--listen", ":9999", "--timeout", "3s"]
+    image: haproxy:3.0-alpine
     ports:
       - "9999:9999"
+    volumes:
+      - ./haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
     deploy:
       resources:
         limits:
