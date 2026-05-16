@@ -70,7 +70,7 @@ func releaseBackend(idx int) {
 	atomic.AddInt64(&connCounts[idx], -1)
 }
 
-func proxy(client net.Conn, backend string, idx int, timeout time.Duration) {
+func proxy(client net.Conn, backend string, idx int) {
 	defer releaseBackend(idx)
 	defer client.Close()
 
@@ -80,11 +80,9 @@ func proxy(client net.Conn, backend string, idx int, timeout time.Duration) {
 	}
 	defer server.Close()
 
-	deadline := time.Now().Add(timeout)
-	client.SetDeadline(deadline)
-	server.SetDeadline(deadline)
+	// No deadlines — let the TCP stack handle timeouts natively.
+	// Deadlines cause RST when they fire mid-transfer with Java clients.
 
-	// Bidirectional copy. No CloseWrite — let the deferred Close() handle cleanup.
 	var wg sync.WaitGroup
 	wg.Add(2)
 
@@ -103,7 +101,6 @@ func proxy(client net.Conn, backend string, idx int, timeout time.Duration) {
 
 func main() {
 	listenAddr := flag.String("listen", ":9999", "listen address")
-	timeout := flag.Duration("timeout", 3*time.Second, "total proxy timeout")
 	flag.Parse()
 
 	for i, addr := range backends {
@@ -114,7 +111,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("Failed to listen on %s: %v", *listenAddr, err)
 	}
-	log.Printf("[lb] Listening on %s → %v (least-conn, timeout=%v)", *listenAddr, backends, *timeout)
+	log.Printf("[lb] Listening on %s → %v (least-conn)", *listenAddr, backends)
 
 	for {
 		conn, err := ln.Accept()
@@ -123,6 +120,6 @@ func main() {
 			continue
 		}
 		backend, idx := pickBackend()
-		go proxy(conn, backend, idx, *timeout)
+		go proxy(conn, backend, idx)
 	}
 }
