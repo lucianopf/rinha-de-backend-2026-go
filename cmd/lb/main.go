@@ -84,23 +84,18 @@ func proxy(client net.Conn, backend string, idx int, timeout time.Duration) {
 	client.SetDeadline(deadline)
 	server.SetDeadline(deadline)
 
+	// Bidirectional copy. No CloseWrite — let the deferred Close() handle cleanup.
 	var wg sync.WaitGroup
 	wg.Add(2)
 
 	go func() {
 		defer wg.Done()
 		io.Copy(server, client)
-		if tcp, ok := server.(*net.TCPConn); ok {
-			tcp.CloseWrite()
-		}
 	}()
 
 	go func() {
 		defer wg.Done()
 		io.Copy(client, server)
-		if tcp, ok := client.(*net.TCPConn); ok {
-			tcp.CloseWrite()
-		}
 	}()
 
 	wg.Wait()
