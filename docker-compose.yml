@@ -1,6 +1,7 @@
 services:
   api1:
     image: ghcr.io/lucianopf/rinha-de-backend-2026-go:latest
+    command: ["./server", "--port", "8080", "--model", "resources/model.bin"]
     deploy:
       resources:
         limits:
@@ -12,6 +13,7 @@ services:
 
   api2:
     image: ghcr.io/lucianopf/rinha-de-backend-2026-go:latest
+    command: ["./server", "--port", "8080", "--model", "resources/model.bin"]
     deploy:
       resources:
         limits:
@@ -22,7 +24,8 @@ services:
     restart: unless-stopped
 
   lb:
-    image: ghcr.io/lucianopf/rinha-de-backend-2026-go-lb:latest
+    image: ghcr.io/lucianopf/rinha-de-backend-2026-go:latest
+    command: ["./lb", "--listen", ":9999", "--timeout", "3s"]
     ports:
       - "9999:9999"
     deploy:
