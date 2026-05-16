@@ -9,13 +9,18 @@ WORKDIR /app
 COPY go.mod go.sum ./
 RUN go mod download
 
-# Build
+# Build server and LB
 COPY cmd/ ./cmd/
 RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build \
     -ldflags="-s -w" \
     -trimpath \
     -o /app/server \
     ./cmd/server/
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build \
+    -ldflags="-s -w" \
+    -trimpath \
+    -o /app/lb \
+    ./cmd/lb/
 
 # Stage 2: Minimal runtime
 FROM alpine:3.20
@@ -27,6 +32,7 @@ ENV GOMEMLIMIT=140MiB
 WORKDIR /app
 
 COPY --from=builder /app/server .
+COPY --from=builder /app/lb .
 COPY resources/model.bin ./resources/model.bin
 COPY resources/normalization.json ./resources/normalization.json
 COPY resources/mcc_risk.json ./resources/mcc_risk.json
