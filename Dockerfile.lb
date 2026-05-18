@@ -26,4 +26,4 @@ COPY --from=builder /app/lb .
 EXPOSE 9999
 
 ENTRYPOINT ["./lb"]
-CMD ["--listen", ":9999", "--timeout", "3s"]
+CMD ["--listen", ":9999"]
