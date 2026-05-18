@@ -1,6 +1,6 @@
 services:
   api1:
-    image: ghcr.io/lucianopf/rinha-de-backend-2026-go:v10
+    image: ghcr.io/lucianopf/rinha-de-backend-2026-go:v11
     command: ["./server", "--port", "8080", "--model", "resources/model.bin"]
     deploy:
       resources:
@@ -9,7 +9,7 @@ services:
           memory: "150MB"
     networks: [rinha]
   api2:
-    image: ghcr.io/lucianopf/rinha-de-backend-2026-go:v10
+    image: ghcr.io/lucianopf/rinha-de-backend-2026-go:v11
     command: ["./server", "--port", "8080", "--model", "resources/model.bin"]
     deploy:
       resources:
@@ -18,7 +18,7 @@ services:
           memory: "150MB"
     networks: [rinha]
   lb:
-    image: ghcr.io/lucianopf/rinha-de-backend-2026-go:v10
+    image: ghcr.io/lucianopf/rinha-de-backend-2026-go:v11
     command: ["./lb", "--listen", ":9999"]
     ports: ["9999:9999"]
     deploy:
